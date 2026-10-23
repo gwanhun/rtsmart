@@ -122,6 +122,7 @@ static enum aic_firmware_family g_transition_family = AIC_FW_FAMILY_NONE;
 
 #ifdef AIC8800_DC_BT_UART
 #include <stdarg.h>
+#include <rthw.h>
 
 /* Bluetooth bring-up log, exposed to user space as /dev/aicbt by
  * aic8800_btuart.c. The board's kernel console is on a debug UART that is not
