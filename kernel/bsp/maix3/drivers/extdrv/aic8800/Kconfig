@@ -459,6 +459,43 @@ if RT_USING_AIC8800_WIFI
 
         menu "SDIO Transport Settings"
 
+            config AIC8800_DC_BT_UART
+                bool "AIC8800DC: load the Bluetooth patch and expose UART H:4 as /dev/hciX"
+                select RT_USING_BT_HCI
+                default n
+                help
+                    The SDIO transport has no Bluetooth channel. AIC8800DC
+                    boards that wire the Bluetooth HCI UART to a K230 UART
+                    (01Studio CanMV K230: uart3 on IO50/IO51) can still use
+                    BLE: this uploads fw_adid/fw_patch/fw_patch_table for
+                    8800DC over SDIO before the Wi-Fi runtime (same order as
+                    the vendor Linux aic8800_bsp aicbt_init), configures the
+                    controller for UART port, and registers an H:4 device on
+                    the UART. Progress is readable from /dev/aicbt.
+
+            if AIC8800_DC_BT_UART
+                config AIC8800_DC_BT_UART_NAME
+                    string "UART device for Bluetooth HCI"
+                    default "uart3"
+
+                config AIC8800_DC_BT_UART_BAUD
+                    int "Bluetooth HCI UART baud rate"
+                    default 1500000
+
+                config AIC8800_DC_BT_UART_FLOWCTRL
+                    int "Bluetooth HCI UART hardware flow control (0/1)"
+                    range 0 1
+                    default 0
+
+                config AIC8800_DC_BT_UART_STACK_SIZE
+                    int "Bluetooth UART receive thread stack size"
+                    default 4096
+
+                config AIC8800_DC_BT_UART_PRIORITY
+                    int "Bluetooth UART receive thread priority"
+                    default 12
+            endif
+
             config AIC8800_WIFI_SDIO_RX_BUFFER_SIZE
                 int "Maximum receive aggregate size"
                 range 4096 65536

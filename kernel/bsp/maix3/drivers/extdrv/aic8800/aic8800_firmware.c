@@ -120,6 +120,62 @@ struct aic_patch_info
 static enum aic_firmware_state g_firmware_state = AIC_FW_STATE_COLD;
 static enum aic_firmware_family g_transition_family = AIC_FW_FAMILY_NONE;
 
+#ifdef AIC8800_DC_BT_UART
+#include <stdarg.h>
+
+/* Bluetooth bring-up log, exposed to user space as /dev/aicbt by
+ * aic8800_btuart.c. The board's kernel console is on a debug UART that is not
+ * reachable in the field, so the stages are kept here as plain text. */
+static char g_aic_bt_status[1024];
+static rt_size_t g_aic_bt_status_len;
+
+void aic8800_bt_status(const char *format, ...)
+{
+    va_list args;
+    int written;
+    rt_base_t level;
+
+    level = rt_hw_interrupt_disable();
+    if (g_aic_bt_status_len + 2U < sizeof(g_aic_bt_status))
+    {
+        va_start(args, format);
+        written = rt_vsnprintf(g_aic_bt_status + g_aic_bt_status_len,
+                               sizeof(g_aic_bt_status) - g_aic_bt_status_len - 1U,
+                               format, args);
+        va_end(args);
+        if (written > 0)
+        {
+            g_aic_bt_status_len += (rt_size_t)written;
+            if (g_aic_bt_status_len > sizeof(g_aic_bt_status) - 2U)
+            {
+                g_aic_bt_status_len = sizeof(g_aic_bt_status) - 2U;
+            }
+            g_aic_bt_status[g_aic_bt_status_len++] = '\n';
+            g_aic_bt_status[g_aic_bt_status_len] = '\0';
+        }
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+rt_size_t aic8800_bt_status_read(rt_off_t position, void *buffer,
+                                 rt_size_t size)
+{
+    rt_size_t length;
+
+    if (position < 0 || (rt_size_t)position >= g_aic_bt_status_len)
+    {
+        return 0;
+    }
+    length = g_aic_bt_status_len - (rt_size_t)position;
+    if (length > size)
+    {
+        length = size;
+    }
+    rt_memcpy(buffer, g_aic_bt_status + position, length);
+    return length;
+}
+#endif
+
 static rt_uint16_t aic_fw_get_le16(const rt_uint8_t *data)
 {
     return (rt_uint16_t)data[0] | ((rt_uint16_t)data[1] << 8);
@@ -1380,6 +1436,23 @@ static void aic_firmware_configure_btmode(
     {
         return;
     }
+#ifdef AIC8800_DC_BT_UART
+    if (family == AIC_FW_FAMILY_DC)
+    {
+        /* hwinfo<0, hwinfo, cpmode, btmode=BT_WIFI_COMBO, btport=UART,
+         * baud, flow control, lpm, tx power (vendor aicbt_patch_table_load). */
+        aic_fw_put_le32(data + 4, 1U);
+        aic_fw_put_le32(data + 12, 0xffffffffUL);
+        aic_fw_put_le32(data + 20, 0U);
+        aic_fw_put_le32(data + 28, 1U);
+        aic_fw_put_le32(data + 36, 2U);
+        aic_fw_put_le32(data + 44, (rt_uint32_t)AIC8800_DC_BT_UART_BAUD);
+        aic_fw_put_le32(data + 52, (rt_uint32_t)AIC8800_DC_BT_UART_FLOWCTRL);
+        aic_fw_put_le32(data + 60, 0U);
+        aic_fw_put_le32(data + 68, 0x00006f2fU);
+        return;
+    }
+#endif
     aic_fw_put_le32(data + 4, 1U);
     aic_fw_put_le32(data + 12, 0xffffffffUL);
     aic_fw_put_le32(data + 20, 0U);
@@ -2919,6 +2992,126 @@ static rt_err_t aic_firmware_dc_prepare_calibration(
     return result;
 }
 
+#ifdef AIC8800_DC_BT_UART
+#define AIC_DC_BT_ADID_U02_ADDRESS   0x001017d8U
+#define AIC_DC_BT_PATCH_ADDRESS      0x00184000U
+#define AIC_DC_BT_RESET_ADDRESS      0x40500128U
+#define AIC_DC_BT_RESET_VALUE        0x00000040U
+#define AIC_DC_BT_ADID_FLAG_ADDRESS  0x40500150U
+#define AIC_DC_BT_ADID_FLAG_VALUE    0x00000001U
+
+/* Vendor aic8800_bsp aicbt_init() for AIC8800DC U02, run before the Wi-Fi
+ * runtime is prepared: upload ADID and the BT ROM patch (plus extension
+ * patches), then write every patch-table block with the BT-mode block set to
+ * Wi-Fi/BT combo on the UART port. */
+static rt_err_t aic_firmware_dc_bt_init(struct aic8800_context *context)
+{
+    rt_bool_t high_id = aic_firmware_dc_is_h(context);
+    const char *adid_name = high_id ? "fw_adid_8800dc_u02h.bin" :
+                                      "fw_adid_8800dc_u02.bin";
+    const char *patch_name = high_id ? "fw_patch_8800dc_u02h.bin" :
+                                       "fw_patch_8800dc_u02.bin";
+    const char *table_name = high_id ? "fw_patch_table_8800dc_u02h.bin" :
+                                       "fw_patch_table_8800dc_u02.bin";
+    const char *ext_prefix = high_id ? "fw_patch_8800dc_u02h_ext" :
+                                       "fw_patch_8800dc_u02_ext";
+    rt_uint8_t *table = RT_NULL;
+    rt_size_t table_length = 0;
+    struct aic_patch_info info;
+    rt_uint32_t adid_address = AIC_DC_BT_ADID_U02_ADDRESS;
+    rt_uint32_t patch_address = AIC_DC_BT_PATCH_ADDRESS;
+    rt_uint32_t reset_address = 0;
+    rt_err_t result;
+
+    result = aic_firmware_read_patch_table(context, AIC_FW_FAMILY_DC,
+                                           table_name, &table, &table_length);
+    if (result != RT_EOK)
+    {
+        aic8800_bt_status("bt: table %s read failed %d", table_name, result);
+        return result;
+    }
+    rt_memset(&info, 0, sizeof(info));
+    if (aic_firmware_patch_info(table, table_length, &info) == RT_EOK)
+    {
+        if (info.adid_address)
+        {
+            adid_address = info.adid_address;
+        }
+        if (info.patch_address)
+        {
+            patch_address = info.patch_address;
+        }
+        reset_address = aic_fw_get_le32(table + 40U + 16U);
+    }
+    else
+    {
+        rt_memset(&info, 0, sizeof(info));
+    }
+    aic8800_bt_status("bt: table %s %u bytes adid=0x%08x patch=0x%08x "
+                      "reset=0x%08x ext=%u", table_name,
+                      (unsigned int)table_length, adid_address, patch_address,
+                      reset_address, info.ext_count);
+
+    if (!reset_address)
+    {
+        result = aic_firmware_mem_write(context, AIC_DC_BT_RESET_ADDRESS,
+                                        AIC_DC_BT_RESET_VALUE);
+        if (result == RT_EOK)
+        {
+            result = aic_firmware_mem_write(context,
+                                            AIC_DC_BT_ADID_FLAG_ADDRESS,
+                                            AIC_DC_BT_ADID_FLAG_VALUE);
+        }
+        if (result != RT_EOK)
+        {
+            aic8800_bt_status("bt: reset/adid flag write failed %d", result);
+            goto out;
+        }
+    }
+    result = aic_firmware_upload(context, AIC_FW_FAMILY_DC, adid_name,
+                                 adid_address);
+    aic8800_bt_status("bt: upload %s -> %d", adid_name, result);
+    if (result != RT_EOK)
+    {
+        goto out;
+    }
+    result = aic_firmware_upload(context, AIC_FW_FAMILY_DC, patch_name,
+                                 patch_address);
+    aic8800_bt_status("bt: upload %s -> %d", patch_name, result);
+    if (result != RT_EOK)
+    {
+        goto out;
+    }
+    if (info.ext_count)
+    {
+        result = aic_firmware_mem_write(context, 0x40506004U, 0x04318000U);
+        if (result == RT_EOK)
+        {
+            result = aic_firmware_mem_write(context, 0x40506004U, 0x04338000U);
+        }
+        if (result == RT_EOK)
+        {
+            result = aic_firmware_upload_external_patches(
+                context, AIC_FW_FAMILY_DC, ext_prefix, &info);
+        }
+        aic8800_bt_status("bt: ext patches (%u) -> %d", info.ext_count,
+                          result);
+        if (result != RT_EOK)
+        {
+            goto out;
+        }
+    }
+    result = aic_firmware_apply_patch_table(context, AIC_FW_FAMILY_DC, table,
+                                            table_length);
+    aic8800_bt_status("bt: patch table applied -> %d (uart baud=%u fc=%u)",
+                      result, (unsigned int)AIC8800_DC_BT_UART_BAUD,
+                      (unsigned int)AIC8800_DC_BT_UART_FLOWCTRL);
+out:
+    rt_free(table);
+    return result;
+}
+#endif
+
 static rt_err_t aic_firmware_prepare_dc_runtime(
     struct aic8800_context *context)
 {
@@ -2955,6 +3148,27 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
               context->chip_id, context->chip_sub_id);
         return -RT_ENOSYS;
     }
+#ifdef AIC8800_DC_BT_UART
+    aic8800_bt_status("chip=0x%02x sub=%u mcu=%u h=%d product=0x%04x transport=%s",
+                      context->chip_id, context->chip_sub_id,
+                      context->chip_mcu_id, high_id ? 1 : 0,
+                      context->product_id,
+                      context->transport == AIC8800_TRANSPORT_SDIO ?
+                      "sdio" : "usb");
+    if (context->transport == AIC8800_TRANSPORT_SDIO &&
+        context->product_id == AIC8800_USB_PID_AIC8800DC)
+    {
+        /* A Bluetooth failure must not take Wi-Fi down with it. */
+        rt_err_t bt_result = aic_firmware_dc_bt_init(context);
+
+        aic8800_bt_status("bt: init %s (%d)",
+                          bt_result == RT_EOK ? "ok" : "FAILED", bt_result);
+    }
+    else
+    {
+        aic8800_bt_status("bt: skipped (no BT on this chip/transport)");
+    }
+#endif
     patch_name = aic_firmware_dc_patch_name(context);
     result = aic_firmware_dc_system_config(context);
     if (result == RT_EOK)

@@ -18,6 +18,9 @@ if GetDepend(['AIC8800_WIFI_TRANSPORT_SDIO']):
 if GetDepend(['AIC8800_WIFI_TRANSPORT_USB', 'AIC8800_WIFI_BLE']):
     src += ['aic8800_btusb.c']
 
+if GetDepend(['AIC8800_WIFI_TRANSPORT_SDIO', 'AIC8800_DC_BT_UART']):
+    src += ['aic8800_btuart.c']
+
 CPPPATH = [
     cwd,
     cwd + '/port',
